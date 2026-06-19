@@ -1903,10 +1903,16 @@ static NSNumber *BHTFeatureSwitchOverrideValueForKey(NSString *key) {
     }
 
     // Tab bar configuration
-    if ([key isEqualToString:@"ios_tab_bar_default_show_grok"] ||
-        [key isEqualToString:@"ios_tab_bar_default_show_profile"] ||
-        [key isEqualToString:@"ios_tab_bar_default_show_communities"]) {
-        return @([[NSUserDefaults standardUserDefaults] boolForKey:key]);
+    if ([key isEqualToString:@"ios_tab_bar_default_show_grok"]) {
+        return @([[NSUserDefaults standardUserDefaults] boolForKey:@"ios_tab_bar_default_show_grok"]);
+    }
+
+    if ([key isEqualToString:@"ios_tab_bar_default_show_profile"]) {
+        return @([[NSUserDefaults standardUserDefaults] boolForKey:@"ios_tab_bar_default_show_profile"]);
+    }
+
+    if ([key isEqualToString:@"ios_tab_bar_default_show_communities"]) {
+        return @([[NSUserDefaults standardUserDefaults] boolForKey:@"ios_tab_bar_default_show_communities"]);
     }
 
     // In-app article webview
