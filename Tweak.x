@@ -1688,6 +1688,8 @@ static NSString *BHTWebTwid = nil;
 static NSString *BHTWebAuthMulti = nil;
 
 static NSMutableDictionary<NSString *, NSDictionary *> *BHTWebAccountCookies = nil;
+static NSMutableSet<NSString *> *BHTWebForceCt0UserIDs = nil;
+static NSMutableDictionary<NSString *, NSString *> *BHTWebRejectedTokens = nil;
 static const void *BHTWebPostingUIDKey = &BHTWebPostingUIDKey;
 static const void *BHTCreateTweetWatcherKey = &BHTCreateTweetWatcherKey;
 
@@ -1711,6 +1713,10 @@ static NSDictionary *BHT_cachedPair(NSString *userID) {
     return pair;
 }
 
+static BOOL BHT_rejectedTokenUnlocked(NSString *userID, NSString *token) {
+    return userID.length && token.length && [BHTWebRejectedTokens[userID] isEqualToString:token];
+}
+
 static void BHT_setCachedPair(NSString *userID, NSDictionary *pair) {
     if (userID.length == 0) {
         return;
@@ -1719,13 +1725,83 @@ static void BHT_setCachedPair(NSString *userID, NSDictionary *pair) {
         if (!BHTWebAccountCookies) {
             BHTWebAccountCookies = [NSMutableDictionary dictionary];
         }
+        if (!BHTWebForceCt0UserIDs) {
+            BHTWebForceCt0UserIDs = [NSMutableSet set];
+        }
+        if (!BHTWebRejectedTokens) {
+            BHTWebRejectedTokens = [NSMutableDictionary dictionary];
+        }
         if (pair) {
+            NSString *token = pair[@"auth_token"];
+            if (BHT_rejectedTokenUnlocked(userID, token)) {
+                return;
+            }
             BHTWebAccountCookies[userID] = pair;
+            [BHTWebForceCt0UserIDs removeObject:userID];
+            [BHTWebRejectedTokens removeObjectForKey:userID];
         } else {
             [BHTWebAccountCookies removeObjectForKey:userID];
         }
     });
 }
+
+static BOOL BHT_mustRefreshCt0(NSString *userID) {
+    if (userID.length == 0) {
+        return NO;
+    }
+    __block BOOL yes = NO;
+    dispatch_sync(BHT_accountCacheQueue(), ^{
+        yes = [BHTWebForceCt0UserIDs containsObject:userID];
+    });
+    return yes;
+}
+
+static void BHT_setMustRefreshCt0(NSString *userID, BOOL yes) {
+    if (userID.length == 0) {
+        return;
+    }
+    dispatch_sync(BHT_accountCacheQueue(), ^{
+        if (!BHTWebForceCt0UserIDs) {
+            BHTWebForceCt0UserIDs = [NSMutableSet set];
+        }
+        if (yes) {
+            [BHTWebForceCt0UserIDs addObject:userID];
+        } else {
+            [BHTWebForceCt0UserIDs removeObject:userID];
+        }
+    });
+}
+
+static BOOL BHT_isRejectedAuthToken(NSString *userID, NSString *token) {
+    if (userID.length == 0 || token.length == 0) {
+        return NO;
+    }
+    __block BOOL yes = NO;
+    dispatch_sync(BHT_accountCacheQueue(), ^{
+        yes = BHT_rejectedTokenUnlocked(userID, token);
+    });
+    return yes;
+}
+
+static void BHT_rejectAuthToken(NSString *userID, NSString *token) {
+    if (userID.length == 0) {
+        return;
+    }
+    dispatch_sync(BHT_accountCacheQueue(), ^{
+        if (!BHTWebRejectedTokens) {
+            BHTWebRejectedTokens = [NSMutableDictionary dictionary];
+        }
+        if (!BHTWebForceCt0UserIDs) {
+            BHTWebForceCt0UserIDs = [NSMutableSet set];
+        }
+        if (token.length) {
+            BHTWebRejectedTokens[userID] = token;
+        }
+        [BHTWebForceCt0UserIDs addObject:userID];
+        [BHTWebAccountCookies removeObjectForKey:userID];
+    });
+}
+
 static BOOL BHTWebCookieHarvestInFlight = NO;
 static UIWindow *BHTWebHarvestWindow = nil;
 static BOOL BHTWebBootstrapInFlight = NO;
@@ -1742,6 +1818,13 @@ static const void *BHTWebHarvestWebViewKey = &BHTWebHarvestWebViewKey;
 static void BHT_teardownWebHarvestWindow(void);
 static void BHT_refreshXTID(void);
 static void BHT_refreshWebCookiesViaWebView(void);
+static NSString *BHT_harvestedUserID(void);
+static NSString *BHT_userIDStringForAccount(id account);
+static NSString *BHT_authTokenForUserID(NSString *userID);
+static id BHT_accountForUserID(NSString *userID);
+static void BHT_bootstrapAccount(id account, NSString *userID);
+static NSString *BHT_fetchCt0Sync(NSString *authToken, NSString *expectedUserID, BOOL *outLoggedOut);
+static void BHT_invalidateWebSession(NSString *userID);
 
 @interface WKWebView (BHTAsyncJavaScript)
 - (void)callAsyncJavaScript:(NSString *)functionBody
@@ -1786,7 +1869,17 @@ static void BHT_storeWebCookies(NSArray<NSHTTPCookie *> *cookies) {
         NSString *digits = [[idPart componentsSeparatedByCharactersInSet:nonDigits] componentsJoinedByString:@""];
         liveUserID = digits.length ? digits : nil;
     }
+    if (liveUserID.length && BHT_isRejectedAuthToken(liveUserID, BHTWebAuthToken)) {
+        BHTWebAuthToken = nil;
+        BHTWebCT0 = nil;
+        BHTWebTwid = nil;
+        BHTWebAuthMulti = nil;
+        return;
+    }
     if (liveUserID.length && BHTWebAuthToken.length && BHTWebCT0.length) {
+        if (BHT_mustRefreshCt0(liveUserID)) {
+            return;
+        }
         BHT_setCachedPair(liveUserID, @{
             @"auth_token": BHTWebAuthToken,
             @"ct0": BHTWebCT0,
@@ -1804,6 +1897,116 @@ static void BHT_harvestWebCookiesFromSharedStorage(void) {
         }
     }
     BHT_storeWebCookies(all);
+}
+
+static BOOL BHT_isTwitterCookieDomain(NSString *domain) {
+    return [domain containsString:@"x.com"] || [domain containsString:@"twitter.com"];
+}
+
+static void BHT_deleteNamedCookiesFromSharedStorage(NSSet<NSString *> *names) {
+    NSHTTPCookieStorage *store = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    for (NSHTTPCookie *cookie in [store.cookies copy]) {
+        if (BHT_isTwitterCookieDomain(cookie.domain ?: @"") && [names containsObject:cookie.name]) {
+            [store deleteCookie:cookie];
+        }
+    }
+}
+
+static void BHT_deleteNamedCookiesFromWKStore(WKHTTPCookieStore *store, NSSet<NSString *> *names) {
+    if (!store) {
+        return;
+    }
+    void (^wipe)(void) = ^{
+        [store getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
+            for (NSHTTPCookie *cookie in cookies) {
+                if (BHT_isTwitterCookieDomain(cookie.domain ?: @"") && [names containsObject:cookie.name]) {
+                    [store deleteCookie:cookie completionHandler:^{}];
+                }
+            }
+        }];
+    };
+    if ([NSThread isMainThread]) {
+        wipe();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), wipe);
+    }
+}
+
+static void BHT_deleteWebCookiesFromStores(NSSet<NSString *> *names) {
+    if (names.count == 0) {
+        return;
+    }
+    BHT_deleteNamedCookiesFromSharedStorage(names);
+    if (@available(iOS 11.0, *)) {
+        BHT_deleteNamedCookiesFromWKStore(WKWebsiteDataStore.defaultDataStore.httpCookieStore, names);
+        WKWebView *helper = BHTWebHelperWebView;
+        if (helper) {
+            BHT_deleteNamedCookiesFromWKStore(helper.configuration.websiteDataStore.httpCookieStore, names);
+        }
+    }
+}
+
+static void BHT_teardownHelperWebView(void) {
+    WKWebView *helper = BHTWebHelperWebView;
+    if (!helper) {
+        return;
+    }
+    BHTWebHelperWebView = nil;
+    BHTWebHelperReady = NO;
+    BHTWebCookieHarvestInFlight = NO;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [helper removeFromSuperview];
+    });
+}
+
+// Drop a revoked web session so harvest cannot keep re-feeding the dead auth_token.
+// Native SSO in the hidden T1WebViewController mints a replacement. A client-side
+// cookie Expires= date would not revive a token X has already rejected.
+static void BHT_invalidateWebSession(NSString *userID) {
+    NSString *deadToken = BHT_authTokenForUserID(userID);
+    if (deadToken.length == 0) {
+        deadToken = BHT_cachedPair(userID)[@"auth_token"];
+    }
+    if (deadToken.length == 0) {
+        deadToken = BHTWebAuthToken;
+    }
+    BHT_rejectAuthToken(userID, deadToken);
+
+    NSString *harvested = BHT_harvestedUserID();
+    if (userID.length == 0 || harvested.length == 0 || [userID isEqualToString:harvested]) {
+        BHTWebAuthToken = nil;
+        BHTWebCT0 = nil;
+        BHTWebTwid = nil;
+        BHTWebAuthMulti = nil;
+    }
+
+    BHT_deleteWebCookiesFromStores([NSSet setWithObjects:@"auth_token", @"ct0", @"twid", @"auth_multi", nil]);
+    BHT_teardownHelperWebView();
+
+    id account = userID.length ? BHT_accountForUserID(userID) : nil;
+    if (!account) {
+        account = BHT_accountForAuthenticatedWebView();
+    }
+    NSString *bootstrapUID = userID.length ? userID : BHT_userIDStringForAccount(account);
+    if (account && bootstrapUID.length) {
+        BHT_bootstrapAccount(account, bootstrapUID);
+    }
+}
+
+static void BHT_noteWebAuthFailure(NSString *userID, NSInteger statusCode) {
+    if (userID.length == 0) {
+        return;
+    }
+    if (statusCode == 401 || BHT_mustRefreshCt0(userID)) {
+        BHT_invalidateWebSession(userID);
+        return;
+    }
+    if (statusCode == 403) {
+        BHT_setMustRefreshCt0(userID, YES);
+        BHT_setCachedPair(userID, nil);
+        BHT_deleteWebCookiesFromStores([NSSet setWithObject:@"ct0"]);
+        return;
+    }
 }
 
 static void BHT_onHelperWebViewLoaded(WKWebView *webView);
@@ -1831,6 +2034,13 @@ static void BHT_seedHelperCookies(WKWebView *webView, void (^done)(void)) {
         NSDictionary *pairs = @{ @"auth_token": BHTWebAuthToken ?: @"",
                                  @"ct0": BHTWebCT0 ?: @"",
                                  @"twid": BHTWebTwid ?: @"" };
+        if (BHTWebAuthToken.length) {
+            NSString *seedUID = BHT_harvestedUserID();
+            if (seedUID.length && BHT_isRejectedAuthToken(seedUID, BHTWebAuthToken)) {
+                done();
+                return;
+            }
+        }
         for (NSString *name in pairs) {
             NSString *value = pairs[name];
             if (value.length == 0) continue;
@@ -2091,9 +2301,44 @@ static void BHT_prewarmWebCookiesIfNeeded(void) {
 
     id current = BHT_accountForAuthenticatedWebView();
     NSString *currentUserID = BHT_userIDStringForAccount(current);
-    if (current && currentUserID.length && !BHT_cachedPair(currentUserID)) {
-        BHT_bootstrapAccount(current, currentUserID);
+    if (!current || currentUserID.length == 0) {
+        return;
     }
+
+    NSDictionary *pair = BHT_cachedPair(currentUserID);
+    NSString *token = pair[@"auth_token"] ?: BHT_authTokenForUserID(currentUserID);
+    if (token.length == 0 || BHT_isRejectedAuthToken(currentUserID, token)) {
+        BHT_bootstrapAccount(current, currentUserID);
+        return;
+    }
+
+    static NSMutableSet<NSString *> *probedUsers = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        probedUsers = [NSMutableSet set];
+    });
+    @synchronized (probedUsers) {
+        if ([probedUsers containsObject:currentUserID]) {
+            return;
+        }
+        [probedUsers addObject:currentUserID];
+    }
+
+    NSString *probeUserID = [currentUserID copy];
+    NSString *probeToken = [token copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        BOOL loggedOut = NO;
+        NSString *fresh = BHT_fetchCt0Sync(probeToken, probeUserID, &loggedOut);
+        if (loggedOut) {
+            BHT_invalidateWebSession(probeUserID);
+        } else if (fresh.length) {
+            BHT_setCachedPair(probeUserID, @{
+                @"auth_token": probeToken,
+                @"ct0": fresh,
+                @"twid": [NSString stringWithFormat:@"u=%@", probeUserID],
+            });
+        }
+    });
 }
 
 #pragma mark - Request / response transforms
@@ -2210,6 +2455,9 @@ static NSString *BHT_authTokenForUserID(NSString *userID) {
 
     NSString *primaryUID = BHT_harvestedUserID();
     if (primaryUID.length && [primaryUID isEqualToString:userID] && BHTWebAuthToken.length) {
+        if (BHT_isRejectedAuthToken(userID, BHTWebAuthToken)) {
+            return nil;
+        }
         return BHTWebAuthToken;
     }
 
@@ -2226,7 +2474,7 @@ static NSString *BHT_authTokenForUserID(NSString *userID) {
         }
         NSString *uid = [entry substringToIndex:colon.location];
         NSString *token = [entry substringFromIndex:NSMaxRange(colon)];
-        if ([uid isEqualToString:userID] && token.length) {
+        if ([uid isEqualToString:userID] && token.length && !BHT_isRejectedAuthToken(userID, token)) {
             return token;
         }
     }
@@ -2267,9 +2515,22 @@ static BOOL BHT_waitUntilReadyBounded(BOOL (^ready)(void), void (^kick)(void), N
 }
 
 static BOOL BHT_resolveWebCreds(NSString *userID, NSString **outAuthToken, NSString **outCt0) {
+    if (BHT_mustRefreshCt0(userID)) {
+        if (outAuthToken) {
+            *outAuthToken = nil;
+        }
+        if (outCt0) {
+            *outCt0 = nil;
+        }
+        return NO;
+    }
     NSDictionary *cached = BHT_cachedPair(userID);
     NSString *authToken = cached[@"auth_token"];
     NSString *ct0 = cached[@"ct0"];
+    if (BHT_isRejectedAuthToken(userID, authToken)) {
+        authToken = nil;
+        ct0 = nil;
+    }
     if (outAuthToken) {
         *outAuthToken = authToken;
     }
@@ -2330,7 +2591,10 @@ static NSString *BHT_userIDDigitsFromTwid(NSString *twid) {
     return digits.length ? digits : nil;
 }
 
-static NSString *BHT_fetchCt0Sync(NSString *authToken, NSString *expectedUserID) {
+static NSString *BHT_fetchCt0Sync(NSString *authToken, NSString *expectedUserID, BOOL *outLoggedOut) {
+    if (outLoggedOut) {
+        *outLoggedOut = NO;
+    }
     if (authToken.length == 0 || [NSThread isMainThread]) {
         return nil;
     }
@@ -2358,6 +2622,9 @@ static NSString *BHT_fetchCt0Sync(NSString *authToken, NSString *expectedUserID)
     [session finishTasksAndInvalidate];
 
     if (fetcher.loggedOut) {
+        if (outLoggedOut) {
+            *outLoggedOut = YES;
+        }
         return nil;
     }
 
@@ -2428,7 +2695,8 @@ static NSMutableURLRequest *BHT_webRequestFromNativeSend(NSURLRequest *request) 
                 }
             }
 
-            NSString *fresh = BHT_fetchCt0Sync(token, postingUserID);
+            BOOL loggedOut = NO;
+            NSString *fresh = BHT_fetchCt0Sync(token, postingUserID, &loggedOut);
             if (fresh.length) {
                 authToken = token;
                 ct0 = fresh;
@@ -2437,9 +2705,11 @@ static NSMutableURLRequest *BHT_webRequestFromNativeSend(NSURLRequest *request) 
                     @"ct0": fresh,
                     @"twid": [NSString stringWithFormat:@"u=%@", postingUserID],
                 });
+            } else if (loggedOut) {
+                BHT_invalidateWebSession(postingUserID);
+                token = nil;
             } else {
                 BHT_setCachedPair(postingUserID, nil);
-                token = nil;
             }
         }
 
@@ -2452,14 +2722,14 @@ static NSMutableURLRequest *BHT_webRequestFromNativeSend(NSURLRequest *request) 
     BHT_applyWebAuth(outgoing, authToken, ct0, postingUserID);
     [outgoing setValue:BHTWebXTID forHTTPHeaderField:@"x-client-transaction-id"];
     BHT_refreshXTID();
-    // Tag the request with the account it's posting as so the task observer can invalidate the
-    // right account's cached ct0 if the send comes back 4xx.
+    // Tag the request with the account it's posting as so the task observer can
+    // refresh or invalidate that account's web session if the send comes back 4xx.
     objc_setAssociatedObject(outgoing, BHTWebPostingUIDKey, postingUserID, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return outgoing;
 }
 
-// Watches a rewritten CreateTweet task and, if it finishes with a 4xx, it drops the ct0
-// from the cache
+// Watches a rewritten CreateTweet task. 401 (or a second 403) invalidates the
+// stored web session so harvest cannot keep replaying a revoked auth_token.
 @interface BHTCreateTweetWatcher : NSObject
 @property (nonatomic, copy) NSString *userID;
 @end
@@ -2483,8 +2753,8 @@ static NSMutableURLRequest *BHT_webRequestFromNativeSend(NSURLRequest *request) 
     NSInteger code = [task.response isKindOfClass:[NSHTTPURLResponse class]]
         ? [(NSHTTPURLResponse *)task.response statusCode] : 0;
     NSString *userID = keepAlive.userID;
-    if (code >= 400 && code < 500 && userID.length) {
-        BHT_setCachedPair(userID, nil);
+    if (userID.length) {
+        BHT_noteWebAuthFailure(userID, code);
     }
     (void)keepAlive;
 }
